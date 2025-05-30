@@ -1,0 +1,2147 @@
+---
+title: "TFM"
+author: "Marc Bravo"
+date: "2025-05-18"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Filtrado de secuencias
+
+```{r}
+library(Biostrings)
+
+# Función para filtrar secuencias, modificar cabeceras y eliminar duplicadas
+filtrar_fasta <- function(input_fasta, output_fasta, min_length = 167000, max_N_percentage = 0.05) {
+  # Cargar secuencias del archivo
+  secuencias <- readDNAStringSet(input_fasta)
+  
+  # Contar el número total de secuencias antes del filtrado
+  total_secuencias_iniciales <- length(secuencias)
+  
+  cat("Total de secuencias iniciales:", total_secuencias_iniciales, "\n")
+  
+  # Filtrar por longitud mínima
+  secuencias_longitud <- secuencias[width(secuencias) >= min_length]
+  total_secuencias_longitud <- length(secuencias_longitud)
+  
+  cat("Secuencias que pasan el filtro de longitud (≥", min_length, "):", total_secuencias_longitud, "\n")
+  
+  # Función auxiliar para calcular el porcentaje de 'N'
+  calcular_porcentaje_N <- function(seq) {
+    total_N <- sum(alphabetFrequency(seq)["N"])
+    return(total_N / length(seq)) 
+  }
+  
+  # Filtrar por porcentaje de 'N'
+  secuencias_filtradas <- secuencias_longitud[
+    vapply(secuencias_longitud, calcular_porcentaje_N, numeric(1)) <= max_N_percentage
+  ]
+  total_secuencias_filtradas <- length(secuencias_filtradas)
+  
+  cat("Secuencias que pasan el filtro de porcentaje de 'N' (≤", max_N_percentage * 100, "%):", total_secuencias_filtradas, "\n")
+  
+  # Modificar las cabeceras para que solo contengan el código de secuencia
+  names(secuencias_filtradas) <- sub(" .*", "", names(secuencias_filtradas))
+  
+  # Eliminar secuencias duplicadas manteniendo solo la primera
+  unique_sequences <- unique(secuencias_filtradas)
+  total_secuencias_unicas <- length(unique_sequences)
+  secuencias_duplicadas_eliminadas <- total_secuencias_filtradas - total_secuencias_unicas
+  
+  # Guardar las secuencias filtradas y únicas en un nuevo archivo FASTA
+  writeXStringSet(unique_sequences, output_fasta)
+  
+  # Imprimir resumen final
+  cat("Secuencias duplicadas eliminadas:", secuencias_duplicadas_eliminadas, "\n")
+  cat("Total de secuencias únicas guardadas:", total_secuencias_unicas, "\n")
+  cat("Se guardaron", total_secuencias_unicas, "secuencias en", output_fasta, "\n")
+}
+
+# Uso de la función
+filtrar_fasta("Genbank.fasta", "Genbank.fasta2.fasta")
+```
+Se carga el archivo de salida en el servidor web Nextclade (clades.nextstrain.org).
+Se descarga un CSV con las secuencias a las que se les asigna clado y pasan el control de calidad (<100).
+
+```{r}
+library(readr)
+library(Biostrings)
+library(dplyr)
+
+# Archivos
+fasta_file <- "Genbank.fasta2"
+tsv_file <- "metadata.tsv"
+csv_file <- "nextclade.csv"
+
+# Cargar CSV de salida de Nextclade
+filtre_df <- read_delim(csv_file, delim = ";", col_types = cols(.default = "c"))
+
+# Extraer los "accession" válidos del archivo nextclade.csv
+accession_validos <- filtre_df$accession
+
+# Filtrar FASTA
+# Cargar secuencias FASTA
+sequences <- readDNAStringSet(fasta_file)
+
+# Extraer nombres de secuencias
+seq_names <- names(sequences)
+
+# Filtrar secuencias cuyo encabezado esté en la lista de accession válidos
+valid_seqs <- seq_names %in% accession_validos
+filtered_sequences <- sequences[valid_seqs]
+
+# Guardar el nuevo archivo FASTA con las secuencias filtradas
+filtered_fasta_file <- "filtered_sequences.fasta"
+writeXStringSet(filtered_sequences, filtered_fasta_file)
+
+# Filtrar TSV
+# Cargar archivo TSV
+metadata_df <- read_delim(tsv_file, delim = "\t", col_types = cols(.default = "c"))
+
+# Filtrar filas que coincidan con los accession válidos
+metadata_filtered <- metadata_df %>%
+  filter(accession %in% accession_validos)
+
+# Unir las columnas "clade" y "lineage" del CSV de Nextclade al metadata filtrado
+metadata_filtered <- metadata_filtered %>%
+  left_join(filtre_df %>% select(accession, clade, lineage), by = "accession")
+
+# Reemplazar NA por cadenas vacías antes de escribir el archivo
+metadata_filtered[is.na(metadata_filtered)] <- ""
+
+# Guardar el archivo filtrado en un nuevo TSV sin "NA"
+filtered_tsv_file <- "filtered_metadata.tsv"
+write_delim(metadata_filtered, filtered_tsv_file, delim = "\t", na = "")
+
+# Imprimir resultados
+cat("\nResultados del filtrado:\n")
+cat("Archivo FASTA:\n")
+cat(" - Total de secuencias originales:", length(sequences), "\n")
+cat(" - Total de secuencias después del filtrado:", length(filtered_sequences), "\n\n")
+cat("Archivo TSV:\n")
+cat(" - Total de filas originales:", nrow(metadata_df), "\n")
+cat(" - Total de filas después del filtrado:", nrow(metadata_filtered), "\n\n")
+cat("Archivos generados:\n")
+cat(" - FASTA filtrado guardado en:", filtered_fasta_file, "\n")
+cat(" - TSV filtrado guardado en:", filtered_tsv_file, "\n")
+```
+
+## Filtrar secuencias por clados
+
+```{r}
+library(Biostrings)
+library(dplyr)
+library(readr)
+library(stringr)
+
+# Archivos
+fasta_file <- "filtered_sequences.fasta"
+metadata_file <- "filtered_metadata.tsv"
+
+# Leer las secuencias FASTA
+sequences <- readDNAStringSet(fasta_file)
+
+# Leer el archivo TSV con metadatos
+metadata <- read_delim(metadata_file, delim = "\t", col_types = cols(.default = "c"))
+
+# Extraer nombres de secuencias en FASTA
+seq_names <- names(sequences)
+
+# Función para filtrar y guardar FASTA
+guardar_fasta <- function(df, sequences, condition, filename, outgroup = NULL) {
+  # Filtrar el dataframe según la condición
+  filtered_df <- df %>% filter(eval(parse(text = condition)))
+  
+  # Obtener los IDs de secuencia que cumplen la condición
+  seq_ids <- filtered_df$accession
+  
+  # Filtrar secuencias en el archivo FASTA
+  filtered_seqs <- sequences[names(sequences) %in% seq_ids]
+  
+  # Agregar outgroup si está definido
+  if (!is.null(outgroup) && outgroup %in% seq_names) {
+    filtered_seqs <- c(filtered_seqs, sequences[outgroup])
+  }
+  
+  # Verificar si hay secuencias para guardar
+  if (length(filtered_seqs) > 0) {
+    writeXStringSet(filtered_seqs, filename)  # Guardar archivo FASTA
+    cat("Guardado:", filename, "con", length(filtered_seqs), "secuencias\n")
+  } else {
+    cat("No se encontraron secuencias para", filename, "\n")
+  }
+}
+
+# Filtrar y guardar según las condiciones
+guardar_fasta(metadata, sequences, "clade %in% c('Ia', 'Ib')", "Clades/clade_I.fasta", outgroup = "KJ642617")
+guardar_fasta(metadata, sequences, "clade == 'Ia'", "Clades/clade_Ia.fasta", outgroup = "KJ642617")
+guardar_fasta(metadata, sequences, "clade == 'Ib'", "Clades/clade_Ib.fasta", outgroup = "KJ642617")
+
+guardar_fasta(metadata, sequences, "clade %in% c('IIa', 'IIb')", "Clades/clade_II.fasta", outgroup = "KJ642616")
+guardar_fasta(metadata, sequences, "clade == 'IIa'", "Clades/clade_IIa.fasta", outgroup = "KJ642616")
+guardar_fasta(metadata, sequences, "clade == 'IIb'", "Clades/clade_IIb.fasta", outgroup = "KJ642616")
+
+guardar_fasta(metadata, sequences, "clade == 'IIb' & (is.na(lineage) | str_starts(lineage, 'A'))", "Clades/clade_IIb_A.fasta", outgroup = "KJ642616")
+guardar_fasta(metadata, sequences, "clade == 'IIb' & !(is.na(lineage) | str_starts(lineage, 'A'))", "Clades/clade_IIb_B.fasta", outgroup = "KJ642616")
+```
+
+## Gráficos clasificación secuencias
+# Figura 2
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+
+# Cargar datos
+file_path <- "filtered_metadata.tsv"
+data <- read_tsv(file_path)
+
+# Convertir la columna 'date' en año
+clean_data <- data %>%
+  mutate(year = as.integer(str_extract(date, "\\d{4}")),
+         region = if_else(is.na(region) | region == "", "Desconocida", region),
+         host = if_else(is.na(host) | host == "", "Desconocido", host))
+
+# Traducir nombres de las regiones
+region_translation <- c("Africa" = "África", "Asia" = "Asia", "Europe" = "Europa", 
+                        "North America" = "América del Norte", "Oceania" = "Oceanía", 
+                        "South America" = "América del Sur", "Unknown" = "Desconocida")
+clean_data <- clean_data %>% mutate(region = recode(region, !!!region_translation))
+
+# Traducir nombres de los hosts
+host_translation <- c("Cricetomys gambianus" = "Rata gigante africana", "Cynomys" = "Perro de la pradera", 
+                      "Funisciurus" = "Ardilla africana", "Gliridae" = "Lirón", 
+                      "Homo sapiens" = "Humano", "Pan troglodytes verus" = "Chimpancé", 
+                      "Platyrrhini" = "Platirrino", "Desconocido" = "Desconocido")
+clean_data <- clean_data %>% mutate(host = recode(host, !!!host_translation))
+
+# Crear columna de clado agrupado
+clean_data <- clean_data %>%
+  mutate(clade_group = case_when(
+    clade == "Ia" ~ "Clade Ia",
+    clade == "Ib" ~ "Clade Ib",
+    clade == "IIa" ~ "Clade IIa",
+    clade == "IIb" & (is.na(lineage) | str_starts(lineage, "A")) ~ "Clade IIb_A",
+    clade == "IIb" & !(is.na(lineage) | str_starts(lineage, "A")) ~ "Clade IIb_B",
+    TRUE ~ NA_character_
+  ))
+
+# Crear una secuencia de años desde 1955 hasta el año máximo conocido
+year_range <- 1955:max(clean_data$year, na.rm = TRUE)
+
+# Paleta de colores por región
+custom_colors <- c("África" = "#ef280f", "Asia" = "#e3ab2c", "Europa" = "#024a86", 
+                   "América del Norte" = "#02ac66", "Oceanía" = "#8c4966", 
+                   "América del Sur" = "#e36b2c", "Desconocida" = "#999999")
+
+# Paleta de colores por host
+host_colors <- c("Rata gigante africana" = "#024a86", "Perro de la pradera" = "#23bac4", 
+                 "Ardilla africana" = "#8c4966", "Lirón" = "#984ea3", "Humano" = "#ef280f", 
+                 "Chimpancé" = "#6dc36d", "Platirrino" = "#e3ab2c", "Desconocido" = "#999999")
+
+# Gráficos de barras por clado
+plot_list <- list()
+for (clade_type in na.omit(unique(clean_data$clade_group))) {
+  plot_data <- clean_data %>% 
+    filter(clade_group == clade_type, !is.na(year))
+  
+  p <- ggplot(plot_data, aes(x = factor(year, levels = year_range), fill = region)) +
+    geom_bar(position = "stack", width = 1) +
+    scale_x_discrete(drop = FALSE, labels = function(x) ifelse(as.integer(x) %% 5 == 0, x, "")) +
+    scale_fill_manual(values = custom_colors) +
+    labs(
+      title = paste("Distribución de", clade_type, "por año y región"),
+      x = "Año",
+      y = "Número de secuencias"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 12),
+      legend.position = "none"
+    )
+  
+  print(p)
+  ggsave(filename = paste0("plots/", clade_type, "_barras.png"), plot = p, width = 8, height = 4)
+  plot_list[[clade_type]] <- p
+}
+
+# Gráficos de pastel (quesitos) por clado
+pie_list <- list()
+for (clade_type in na.omit(unique(clean_data$clade_group))) {
+  pie_data <- clean_data %>% 
+    filter(clade_group == clade_type) %>% 
+    count(host)
+  
+  p_pie <- ggplot(pie_data, aes(x = "", y = n, fill = host)) +
+    geom_bar(stat = "identity", width = 1) +
+    coord_polar(theta = "y") +
+    scale_fill_manual(values = host_colors) +
+    labs(title = paste("Distribución de host en", clade_type)) +
+    theme_void() +
+    theme(legend.position = "none")
+  
+  print(p_pie)
+  ggsave(filename = paste0("plots/", clade_type, "_quesito.png"), plot = p_pie, width = 6, height = 6)
+  pie_list[[clade_type]] <- p_pie
+}
+```
+# Figura S1
+
+```{r}
+# Crear secuencia completa de años
+year_range <- 1955:2025
+
+# Asegurar que clade_group no tiene NA
+clade_filtered <- clean_data %>%
+  filter(!is.na(year), !is.na(clade_group)) %>%
+  mutate(year = as.integer(year)) %>%
+  filter(year >= 1955, year <= 2025)
+
+# Colores de clados
+clade_colors <- c(
+  "Clade Ia"    = "#73B436",
+  "Clade Ib"    = "#CC4551",
+  "Clade IIa"   = "#F8A72D",
+  "Clade IIb_A" = "#5C96CC",
+  "Clade IIb_B" = "#CF83D5"
+)
+
+
+# Gráfico 1: Total de secuencias por clado
+clade_counts <- clade_filtered %>%
+  count(clade_group)
+
+p1 <- ggplot(clade_counts, aes(x = clade_group, y = n, fill = clade_group)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = n), vjust = -0.5, size = 4) +
+  scale_fill_manual(values = clade_colors) +
+  labs(
+    title = "Número total de secuencias por clado",
+    x = "Clado",
+    y = "Número de secuencias"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title = element_text(size = 12)
+  )
+
+ggsave("plots/secuencias_por_clado.png", plot = p1, width = 4, height = 6)
+print(p1)
+
+
+# Gráfico 2: Proporción de clados por año (1955–2025)
+proportion_data <- expand.grid(
+  year = year_range,
+  clade_group = unique(clade_filtered$clade_group)
+) %>%
+  left_join(
+    clade_filtered %>% count(year, clade_group),
+    by = c("year", "clade_group")
+  ) %>%
+  replace_na(list(n = 0)) %>%
+  group_by(year) %>%
+  mutate(prop = if (sum(n) == 0) 0 else n / sum(n))
+
+p2 <- ggplot(proportion_data, aes(x = factor(year, levels = year_range), y = prop, fill = clade_group)) +
+  geom_bar(stat = "identity", position = "stack", width = 1) +
+  scale_fill_manual(values = clade_colors) +
+  scale_x_discrete(drop = FALSE, labels = function(x) ifelse(as.integer(x) %% 5 == 0, x, "")) +
+  labs(
+    title = "Proporción de secuencias por clado recogidas cada año (1955–2025)",
+    x = "Año",
+    y = "Proporción"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12)
+  )
+
+ggsave("plots/proporcion_clado_por_anio.png", plot = p2, width = 10, height = 4)
+print(p2)
+
+
+# Gráfico 3: Número de secuencias por año (1955–2025)
+count_data <- data.frame(year = year_range) %>%
+  left_join(
+    clade_filtered %>% count(year),
+    by = "year"
+  ) %>%
+  replace_na(list(n = 0))
+
+p3 <- ggplot(count_data, aes(x = factor(year, levels = year_range), y = n)) +
+  geom_bar(stat = "identity", fill = "#000078", width = 1) +
+  scale_x_discrete(drop = FALSE, labels = function(x) ifelse(as.integer(x) %% 10 == 0, x, "")) +
+  labs(
+    title = "Número de secuencias recogidas por año (1955–2025)",
+    x = "Año",
+    y = "Número de secuencias"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 15),
+    axis.title = element_text(size = 15)
+  )
+
+ggsave("plots/num_secuencias_por_anio_1955_2025.png", plot = p3, width = 10, height = 4)
+print(p3)
+
+
+# Gráfico 4: Número de secuencias por año (1955–2021)
+year_range_2021 <- 1955:2021
+
+count_data_2021 <- data.frame(year = year_range_2021) %>%
+  left_join(
+    clade_filtered %>% count(year),
+    by = "year"
+  ) %>%
+  replace_na(list(n = 0))
+
+p4 <- ggplot(count_data_2021, aes(x = factor(year, levels = year_range_2021), y = n)) +
+  geom_bar(stat = "identity", fill = "#000078", width = 1) +
+  scale_x_discrete(drop = FALSE, labels = function(x) ifelse(as.integer(x) %% 10 == 0, x, "")) +
+  labs(
+    title = "Número de secuencias recogidas por año (1955–2021)",
+    x = "Año",
+    y = "Número de secuencias"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 15),
+    axis.title = element_text(size = 15)
+  )
+
+ggsave("plots/num_secuencias_por_anio_1955_2021.png", plot = p4, width = 10, height = 4)
+print(p4)
+```
+
+## Distribución territorial
+
+```{r}
+# Cargar librerías necesarias
+library(tidyverse)
+library(ggplot2)
+library(maps)
+library(scatterpie)
+library(ggnewscale)
+
+# Corregir nombres de países
+country_fix <- c(
+  "United Kingdom" = "UK",
+  "Republic of the Congo" = "Republic of Congo",
+  "Côte d'Ivoire" = "Ivory Coast"
+)
+
+clean_data <- clean_data %>%
+  mutate(country = recode(country, !!!country_fix))
+
+# Total de secuencias por país
+country_count <- clean_data %>%
+  group_by(country) %>%
+  summarise(total = n())
+
+# Obtener datos del mapa mundial
+world_map <- map_data("world")
+
+# Calcular centroides generales para todos los países
+centroids <- world_map %>%
+  group_by(region) %>%
+  summarise(long = mean(range(long)), lat = mean(range(lat))) %>%
+  ungroup()
+
+# Calcular el centroide de la parte continental de USA
+continental_USA <- world_map %>%
+  filter(region == "USA",
+         long >= -125, long <= -66,
+         lat >= 24, lat <= 50)
+
+if(nrow(continental_USA) > 0){
+  centroid_USA <- continental_USA %>%
+    summarise(long = mean(range(long)), lat = mean(range(lat)))
+  
+  # Reemplazar el centroide de USA con el calculado para la parte continental
+  centroids <- centroids %>%
+    mutate(long = ifelse(region == "USA", centroid_USA$long, long),
+           lat  = ifelse(region == "USA", centroid_USA$lat, lat))
+}
+
+# Unir centroides con datos totales
+country_centroids <- inner_join(country_count, centroids, by = c("country" = "region"))
+
+# Validación (opcional)
+cat("Países no encontrados en el mapa:\n")
+print(setdiff(unique(country_count$country), unique(world_map$region)))
+
+# Unir datos del mapa con total de secuencias
+map_with_data <- left_join(world_map, country_count, by = c("region" = "country"))
+
+# Calcular datos para los pie plots por clado
+country_clade <- clean_data %>%
+  group_by(country, clade_group) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = clade_group, values_from = count, values_fill = list(count = 0)) %>%
+  mutate(total = `Clade Ia` + `Clade Ib` + `Clade IIa` + `Clade IIb_A` + `Clade IIb_B`)
+
+# Unir con centroides
+country_clade_centroids <- inner_join(country_clade, centroids, by = c("country" = "region"))
+
+# Definir colores personalizados para cada clado
+clade_colors <- c(
+  "Clade Ia"    = "#73B436",
+  "Clade Ib"    = "#CC4551",
+  "Clade IIa"   = "#F8A72D",
+  "Clade IIb_A" = "#5C96CC",
+  "Clade IIb_B" = "#CF83D5"
+)
+
+# Crear el gráfico con pie plots y colores definidos
+p <- ggplot() +
+  # Mapa base gris
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group),
+               fill = "gray90", color = "black") +
+  # Países con datos: colorear por total de secuencias
+  geom_polygon(data = map_with_data,
+               aes(x = long, y = lat, group = group, fill = total),
+               color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue",
+                      name = "Total secuencias", na.value = "gray90") +
+  # Reiniciar escala de fill para los pie plots
+  new_scale_fill() +
+  # Pie plots con tamaño proporcional y colores definidos
+  geom_scatterpie(data = country_clade_centroids,
+                  mapping = aes(x = long, y = lat, r = sqrt(total) / 2),
+                  cols = c("Clade Ia", "Clade Ib", "Clade IIa", "Clade IIb_A", "Clade IIb_B"),
+                  inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  scale_fill_manual(values = clade_colors, name = "Clado") +
+  coord_fixed(1.3) +
+  theme_void() +
+  theme(
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background  = element_rect(fill = "transparent", color = NA),
+    legend.position  = "right"
+  ) +
+  labs(title = "Distribución mundial de secuencias por país")
+
+# Mostrar el gráfico
+print(p)
+
+# Guardar el gráfico como PNG
+ggsave("plots/mapa_secuencias_con_pies.png", plot = p, width = 12, height = 7, bg = "transparent")
+```
+
+# Figura 3
+
+```{r}
+# AGREGACIÓN PARA EUROPA
+# Definir vector de países europeos
+european_countries <- c("UK", "France", "Germany", "Spain", "Italy", 
+                        "Sweden", "Norway", "Denmark", "Finland", 
+                        "Ireland", "Belgium", "Netherlands", "Switzerland", 
+                        "Austria", "Portugal", "Slovenia", "Slovakia",
+                        "Czech Republic", "Romania")
+
+# Agregar la información de clados para todos los países europeos
+europe_data <- country_clade %>%
+  filter(country %in% european_countries) %>%
+  summarise(across(c(`Clade Ia`, `Clade Ib`, `Clade IIa`, `Clade IIb_A`, `Clade IIb_B`), sum)) %>%
+  mutate(total = `Clade Ia` + `Clade Ib` + `Clade IIa` + `Clade IIb_A` + `Clade IIb_B`)
+
+# Calcular el centroide de Europa usando los centroides de los países europeos
+europe_centroid <- centroids %>%
+  filter(region %in% european_countries) %>%
+  summarise(long = mean(long), lat = mean(lat))
+
+# Crear una fila que represente a Europa
+europe_row <- europe_data %>%
+  mutate(country = "Europa",
+         long = europe_centroid$long,
+         lat = europe_centroid$lat)
+
+# Excluir de los pies individuales a los países europeos
+non_europe_clade_centroids <- country_clade_centroids %>%
+  filter(!country %in% european_countries)
+
+# Combinar los datos de pie plots: los países no europeos + el único pie agregado para Europa
+pie_data <- bind_rows(non_europe_clade_centroids, europe_row)
+
+# Crear el gráfico con pie plots y colores definidos
+p <- ggplot() +
+  # Mapa base gris
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group),
+               fill = "gray90", color = "black") +
+  # Países con datos: colorear por total de secuencias
+  geom_polygon(data = map_with_data,
+               aes(x = long, y = lat, group = group, fill = total),
+               color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue",
+                      name = "Total secuencias", na.value = "gray90") +
+  # Reiniciar escala de fill para los pie plots
+  new_scale_fill() +
+  # Pie plots con tamaño proporcional y colores definidos
+  geom_scatterpie(data = pie_data,
+                  mapping = aes(x = long, y = lat, r = sqrt(total) / 2),
+                  cols = c("Clade Ia", "Clade Ib", "Clade IIa", "Clade IIb_A", "Clade IIb_B"),
+                  inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  scale_fill_manual(values = clade_colors, name = "Clado") +
+  coord_fixed(1.3) +
+  theme_void() +
+  theme(
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background  = element_rect(fill = "transparent", color = NA),
+    legend.position  = "right"
+  ) +
+  labs(title = "Distribución mundial de secuencias por país")
+
+# Mostrar el gráfico
+print(p)
+
+# Guardar el gráfico como PNG
+ggsave("plots/mapa_secuencias_con_pies.png", plot = p, width = 12, height = 7, bg = "transparent")
+```
+
+# Zooms
+
+```{r}
+# Mapa con zoom en Europa
+p_europa <- ggplot() +
+  # Mapa base gris
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group),
+               fill = "gray90", color = "black") +
+  # Países con datos: colorear por total de secuencias
+  geom_polygon(data = map_with_data,
+               aes(x = long, y = lat, group = group, fill = total),
+               color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", 
+                      name = "Total secuencias", na.value = "gray90") +
+  # Reiniciar escala para la siguiente capa
+  new_scale_fill() +
+  # Agregar pie plots
+  geom_scatterpie(data = country_clade_centroids,
+                  mapping = aes(x = long, y = lat, r = sqrt(total) / 6),
+                  cols = c("Clade Ia", "Clade Ib", "Clade IIa", 
+                           "Clade IIb_A", "Clade IIb_B"),
+                  inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  scale_fill_manual(values = clade_colors, name = "Clado") +
+  # Límites aproximados para Europa
+  coord_fixed(xlim = c(-25, 35), ylim = c(35, 70), ratio = 1.3) +
+  theme_void() +
+  theme(
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background  = element_rect(fill = "transparent", color = NA),
+    legend.position  = "right"
+  ) +
+  labs(title = "Distribución de secuencias en Europa")
+
+print(p_europa)
+ggsave("plots/mapa_secuencias_europa.png", plot = p_europa, 
+       width = 12, height = 7, bg = "transparent")
+
+# Mapa con zoom en la región del centro de África (ajustando tamaño de pie plots)
+p_africa <- ggplot() +
+  # Mapa base gris
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group),
+               fill = "gray90", color = "black") +
+  # Países con datos: colorear por total de secuencias
+  geom_polygon(data = map_with_data,
+               aes(x = long, y = lat, group = group, fill = total),
+               color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", 
+                      name = "Total secuencias", na.value = "gray90") +
+  # Reiniciar escala para la siguiente capa
+  new_scale_fill() +
+  # Agregar pie plots
+  geom_scatterpie(data = country_clade_centroids,
+                  mapping = aes(x = long, y = lat, r = sqrt(total) / 6),
+                  cols = c("Clade Ia", "Clade Ib", "Clade IIa", 
+                           "Clade IIb_A", "Clade IIb_B"),
+                  inherit.aes = FALSE, color = NA, alpha = 0.8) +
+    scale_fill_manual(values = clade_colors, name = "Clado") +
+  # Límites aproximados para el centro de África
+  coord_fixed(xlim = c(-10, 40), ylim = c(-15, 15), ratio = 1.3) +
+  theme_void() +
+  theme(
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background  = element_rect(fill = "transparent", color = NA),
+    legend.position  = "right"
+  ) +
+  labs(title = "Distribución de secuencias en África Central")
+
+print(p_africa)
+ggsave("plots/mapa_secuencias_africa_central.png", plot = p_africa, 
+       width = 12, height = 7, bg = "transparent")
+```
+
+## Alineamiento secuencias
+
+```{bash}
+conda activate squirrel
+
+#Ejemplo clado I
+squirrel /Users/Marc/Desktop/UOC_TFM_MPXV/PEC2/Clades/clade_I.fasta -o /Users/Marc/Desktop/UOC_TFM_MPXV/PEC2/Clades/alineamiento_clade_I --clade cladei
+```
+
+## Construcción arboles filogenéticos
+
+```{bash}
+# Ejemplo clado I
+/Users/Marc/Desktop/iqtree-2.4.0-macOS-intel/bin/iqtree2 \
+    -s /Users/Marc/Desktop/UOC_TFM_MPXV/PEC2/Clades/alineamiento_clade_I/clade_I.aln.fasta \
+    -m MFP \
+    -B 1000 \
+    -o KJ642617 \
+    -nt AUTO
+```
+
+```{bash}
+#Ejemplo arbo temporal clado I
+treetime  \
+    --tree /Users/Marc/Desktop/UOC_TFM_MPXV/PEC2/Clades/alineamiento_clade_I/clade_I_tree.nwk  \
+    --dates /Users/Marc/Desktop/UOC_TFM_MPXV/PEC2/Clades/alineamiento_clade_I/dates_clade_I.csv  \
+    --aln /Users/Marc/Desktop/UOC_TFM_MPXV/PEC2/Clades/alineamiento_clade_I/clade_I.aln.fasta  
+    --outdir /Users/Marc/Desktop/UOC_TFM_MPXV/PEC2/Clades/Timetree
+```
+
+
+
+```{r}
+library(ggtree)
+library(treeio)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(ggstar)
+
+# Leer árbol y metadata
+arbol <- read.newick("Clade_IIa_tree.nwk")
+metadata <- read_tsv("filtered_metadata.tsv")
+
+# Limpiar valores vacíos
+metadata$host[is.na(metadata$host) | metadata$host == ""] <- "Desconocido"
+metadata$country[is.na(metadata$country) | metadata$country == ""] <- "Desconocido"
+
+# Traducir host
+host_translation <- c(
+  "Cricetomys gambianus" = "Rata gigante africana",
+  "Cynomys" = "Perro de la pradera",
+  "Funisciurus" = "Ardilla africana",
+  "Gliridae" = "Lirón",
+  "Homo sapiens" = "Humano",
+  "Pan troglodytes verus" = "Chimpancé",
+  "Platyrrhini" = "Platirrino",
+  "Desconocido" = "Desconocido"
+)
+metadata <- metadata %>% mutate(host = recode(host, !!!host_translation))
+
+# Traducir país
+country_translation <- c(
+  "Côte d'Ivoire" = "Costa de Marfil",
+  "France" = "Francia",
+  "USA" = "Estados Unidos",
+  "Sierra Leone" = "Sierra Leona",
+  "Liberia" = "Liberia",
+  "Desconocido" = "Desconocido"
+)
+metadata <- metadata %>% mutate(country = recode(country, !!!country_translation))
+
+# Filtrar metadata según el árbol
+metadata_filtrada <- metadata %>% filter(strain %in% arbol$tip.label)
+
+formas_star <- c(
+  "Rata gigante africana" = 28,
+  "Perro de la pradera" = 23,
+  "Ardilla africana" = 11,
+  "Lirón" = 4,
+  "Humano" = 15,
+  "Chimpancé" = 1,
+  "Platirrino" = 5,
+  "Desconocido" = 22
+)
+
+# Unir árbol y metadata
+arbol_gg <- ggtree(arbol) %<+% metadata_filtrada
+
+# Dibujar el árbol
+arbol_gg +
+  geom_star(aes(fill = country, starshape = host), size = 4) +
+  scale_starshape_manual(values = formas_star) +
+  theme_tree2() +
+  theme(legend.position = "right") +
+  labs(starshape = "Huésped", fill = "Procedencia")
+
+
+ggsave("plots/arbol_IIa.png", width = 10, height = 4.5, dpi = 300, bg = "transparent")
+```
+
+## Cuantificación de las mutaciones según sus contextos
+
+```{r}
+library(Biostrings)
+
+# Función para recodificar SNPs a contexto pirimidínico
+recodeSNP <- function(ref_base, alt_base, left_base, right_base) {
+  comp <- c(A = "T", T = "A", C = "G", G = "C")
+  list(
+    snp = paste0(comp[ref_base], ">", comp[alt_base]),
+    left = comp[right_base],
+    right = comp[left_base]
+  )
+}
+
+# Generar todos los contextos posibles para los tipos de SNPs en pirimidinas
+snp_types <- c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")
+bases <- c("A", "C", "G", "T")
+context_cols <- c()
+for (snp in snp_types) {
+  for (l in bases) {
+    for (r in bases) {
+      context_cols <- c(context_cols, paste0(l, "[", snp, "]", r))
+    }
+  }
+}
+
+# Lista de carpetas y archivos
+datasets <- list(
+  list(folder = "Clade_Ib",   ref = "_ref.fasta", aln = "clade_Ib.aln.fasta"),
+  list(folder = "Clade_Ia",   ref = "NC_003310_ref.fasta", aln = "clade_Ia.aln.fasta"),
+  list(folder = "Clade_IIa",  ref = "NC_063383_ref.fasta", aln = "clade_IIa.aln.fasta"),
+  list(folder = "Clade_IIb_A", ref = "NC_063383_ref.fasta", aln = "clade_IIb_A.aln.fasta"),
+  list(folder = "Clade_IIb_B", ref = "NC_063383_ref.fasta", aln = "clade_IIb_B.aln.fasta")
+)
+
+# Función principal para analizar un alineamiento
+process_alignment <- function(folder, ref_file, aln_file) {
+  cat("Procesando:", folder, "\n")
+  ref_path <- file.path(folder, ref_file)
+  aln_path <- file.path(folder, aln_file)
+
+  # Leer referencia
+  ref <- readDNAStringSet(ref_path)
+  ref_seq <- as.character(ref[[1]])
+  ref_length <- nchar(ref_seq)
+
+  # Leer alineamientos
+  aln <- readDNAStringSet(aln_path)
+  aln_seqs <- as.character(aln)
+  seq_names <- names(aln)
+
+  # Crear tabla vacía
+  snp_table <- data.frame(matrix(0, nrow = length(aln_seqs), ncol = length(context_cols)))
+  rownames(snp_table) <- seq_names
+  colnames(snp_table) <- context_cols
+
+  # Recorrer secuencias alineadas
+  for (i in seq_along(aln_seqs)) {
+    seq_aln <- aln_seqs[i]
+    for (pos in 2:(ref_length - 1)) {
+      ref_base <- substr(ref_seq, pos, pos)
+      if (!(ref_base %in% bases)) next
+      left_base <- substr(ref_seq, pos - 1, pos - 1)
+      right_base <- substr(ref_seq, pos + 1, pos + 1)
+      if (!(left_base %in% bases) || !(right_base %in% bases)) next
+      
+      alt_base <- substr(seq_aln, pos, pos)
+      if (alt_base == "-" || alt_base == ref_base || !(alt_base %in% bases)) next
+      
+      # Recodificar si es purina
+      if (ref_base %in% c("A", "G")) {
+        recoded <- recodeSNP(ref_base, alt_base, left_base, right_base)
+        current_ref <- substr(recoded$snp, 1, 1)
+        current_change <- recoded$snp
+        current_left <- recoded$left
+        current_right <- recoded$right
+      } else {
+        current_change <- paste0(ref_base, ">", alt_base)
+        current_left <- left_base
+        current_right <- right_base
+      }
+      
+      if (!(current_change %in% snp_types)) next
+      
+      colname <- paste0(current_left, "[", current_change, "]", current_right)
+      if (colname %in% context_cols) {
+        snp_table[i, colname] <- snp_table[i, colname] + 1
+      }
+    }
+  }
+
+  # Guardar resultado
+  output_path <- file.path(folder, "snp_counts.csv")
+  write.csv(snp_table, output_path, row.names = TRUE)
+  cat("Guardado:", output_path, "\n\n")
+}
+
+# Procesar todas las carpetas
+for (dataset in datasets) {
+  process_alignment(dataset$folder, dataset$ref, dataset$aln)
+}
+```
+
+## Representación de las mutaciones y sus contextos
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Colores personalizados para los 6 tipos de SNP
+custom_colors <- c(
+  "C>A" = "#264653",
+  "C>G" = "#2a9d8f",
+  "C>T" = "#8ab17d",
+  "T>A" = "#e9c46a",
+  "T>C" = "#f4a261",
+  "T>G" = "#e76f51"
+)
+
+# Función para extraer el tipo de mutación desde el nombre del contexto
+get_snp_type <- function(context_name) {
+  matches <- regmatches(context_name, regexpr("\\[[CT]>[AGTC]\\]", context_name))
+  if (length(matches) > 0) {
+    gsub("\\[|\\]", "", matches)
+  } else {
+    NA
+  }
+}
+
+# Lista de carpetas donde están los snp_counts.csv
+datasets <- list(
+  list(folder = "Clade_Ib",   file = "snp_counts.csv"),
+  list(folder = "Clade_Ia",   file = "snp_counts.csv"),
+  list(folder = "Clade_IIa",  file = "snp_counts.csv"),
+  list(folder = "Clade_IIb_A", file = "snp_counts.csv"),
+  list(folder = "Clade_IIb_B", file = "snp_counts.csv")
+)
+
+# Generar los gráficos
+for (dataset in datasets) {
+  folder <- dataset$folder
+  csv_path <- file.path(folder, dataset$file)
+  
+  if (!file.exists(csv_path)) {
+    warning(paste("No se encontró:", csv_path))
+    next
+  }
+
+  cat("Generando gráfico para", folder, "\n")
+
+  # Leer la tabla
+  snp_df <- read.csv(csv_path, row.names = 1, check.names = FALSE)
+
+  # Calcular proporciones por fila
+  prop_df <- snp_df / rowSums(snp_df)
+  prop_df[is.na(prop_df)] <- 0
+
+  # Mantener el orden original de las columnas
+  context_names <- colnames(prop_df)
+  mean_props <- colMeans(prop_df)[context_names]
+
+  # Extraer tipo de SNP para cada contexto
+  snp_types <- sapply(context_names, get_snp_type)
+
+  # Construir dataframe para el gráfico
+  plot_df <- data.frame(
+    Context = factor(context_names, levels = context_names),  # mantener orden
+    Proportion = mean_props,
+    SNP_Type = factor(snp_types, levels = names(custom_colors))
+  )
+
+  # Crear gráfico
+  p <- ggplot(plot_df, aes(x = Context, y = Proportion, fill = SNP_Type)) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = custom_colors, na.value = "grey") +
+    labs(
+      title = paste("Distribución media de contextos mutacionales -", folder),
+      x = "Contexto (trinucleótido)", y = "Proporción media",
+      fill = "Tipo de SNP"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+      plot.title = element_text(face = "bold", size = 14),
+      legend.position = "top",
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+
+  # Guardar gráfico como PNG
+  ggsave(
+    filename = file.path(folder, "snp_context_barplot.png"),
+    plot = p,
+    width = 6, height = 6, dpi = 300
+  )
+
+  cat("→ Guardado en:", file.path(folder, "snp_context_barplot.png"), "\n\n")
+}
+```
+
+## Propoción de mutaciones C>T
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+# Clados y sus archivos
+datasets <- list(
+  list(clade = "Clade Ib",   file = "Clade_Ib/snp_counts.csv"),
+  list(clade = "Clade Ia",   file = "Clade_Ia/snp_counts.csv"),
+  list(clade = "Clade IIa",  file = "Clade_IIa/snp_counts.csv"),
+  list(clade = "Clade IIb_A", file = "Clade_IIb_A/snp_counts.csv"),
+  list(clade = "Clade IIb_B", file = "Clade_IIb_B/snp_counts.csv")
+)
+
+# Colores por clado
+clade_colors <- c(
+  "Clade Ia"    = "#73B436",
+  "Clade Ib"    = "#CC4551",
+  "Clade IIa"   = "#F8A72D",
+  "Clade IIb_A" = "#5C96CC",
+  "Clade IIb_B" = "#CF83D5"
+)
+
+# Función para extraer base 5' en contextos C>T
+extract_5prime_base <- function(context_name) {
+  str_match(context_name, "^([ACGT])\\[C>T\\][ACGT]")[,2]
+}
+
+# Inicializar dataframe total
+all_data <- data.frame()
+
+# Procesar cada archivo
+for (dataset in datasets) {
+  clade <- dataset$clade
+  csv_path <- dataset$file
+  
+  if (!file.exists(csv_path)) {
+    warning("No se encontró: ", csv_path)
+    next
+  }
+
+  snp_df <- read.csv(csv_path, row.names = 1, check.names = FALSE)
+  prop_df <- snp_df / rowSums(snp_df)
+  prop_df[is.na(prop_df)] <- 0
+
+  # Filtrar columnas tipo C>T
+  c2t_contexts <- grep("\\[C>T\\]", colnames(prop_df), value = TRUE)
+  bases_5prime <- sapply(c2t_contexts, extract_5prime_base)
+  
+  for (base in c("A", "C", "G", "T")) {
+    relevant_cols <- c2t_contexts[bases_5prime == base]
+    
+    if (length(relevant_cols) == 0) next
+    
+    # Para cada secuencia: proporción de C>T con esa base 5’
+    per_seq_prop <- rowSums(prop_df[, relevant_cols, drop = FALSE])
+    
+    # Normalizar por total C>T en esa secuencia
+    total_c2t <- rowSums(prop_df[, c2t_contexts, drop = FALSE])
+    final_prop <- per_seq_prop / total_c2t
+    final_prop[is.na(final_prop)] <- 0  # En caso de 0 mutaciones
+
+    all_data <- bind_rows(all_data, data.frame(
+      Base_5p = base,
+      Clade = clade,
+      Proportion = mean(final_prop),
+      SD = sd(final_prop)
+    ))
+  }
+}
+
+# Asegurar orden
+all_data$Base_5p <- factor(all_data$Base_5p, levels = c("A", "C", "G", "T"))
+all_data$Clade <- factor(all_data$Clade, levels = names(clade_colors))
+
+# Graficar
+p <- ggplot(all_data, aes(x = Base_5p, y = Proportion, fill = Clade)) +
+  geom_bar(stat = "identity", position = position_dodge(0.9)) +
+  geom_errorbar(aes(ymin = Proportion - SD, ymax = Proportion + SD),
+                position = position_dodge(0.9), width = 0.2, color = "black") +
+  scale_fill_manual(values = clade_colors) +
+  labs(
+    title = "Proporción de bases 5' en mutaciones C>T por clado",
+    x = "Base 5' antes de C>T",
+    y = "Proporción media por secuencia",
+    fill = "Clado"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Guardar gráfico
+write.csv(all_data, "tabla_proporcion_5p_CtoT_por_clado.csv", row.names = FALSE)
+ggsave("proporcion_5p_CtoT_por_clado.png", plot = p, width = 6, height = 6, dpi = 300)
+```
+
+## Estadística mutaciones C>T
+
+```{r}
+library(dplyr)
+library(stringr)
+library(FSA)
+
+# Función para extraer base 5’ en contextos C>T
+extract_5prime_base <- function(context_name) {
+  match <- str_match(context_name, "^([ACGT])\\[C>T\\][ACGT]")
+  return(match[,2])
+}
+
+# Recolectar datos por secuencia
+seq_data <- data.frame()
+
+for (dataset in datasets) {
+  clade <- dataset$clade
+  path <- dataset$file
+  
+  if (!file.exists(path)) next
+  
+  snp_df <- read.csv(path, row.names = 1, check.names = FALSE)
+  prop_df <- snp_df / rowSums(snp_df)
+  prop_df[is.na(prop_df)] <- 0
+  
+  c2t_cols <- grep("\\[C>T\\]", colnames(prop_df), value = TRUE)
+  bases_5p <- sapply(c2t_cols, extract_5prime_base)
+  
+  total_c2t <- rowSums(prop_df[, c2t_cols, drop = FALSE])
+  
+  for (base in c("A", "C", "G", "T")) {
+    relevant_cols <- c2t_cols[bases_5p == base]
+    if (length(relevant_cols) == 0) next
+    
+    base_counts <- rowSums(prop_df[, relevant_cols, drop = FALSE])
+    base_prop <- base_counts / total_c2t
+    base_prop[is.na(base_prop)] <- 0
+    
+    seq_data <- bind_rows(seq_data, data.frame(
+      Clade = clade,
+      Base_5p = base,
+      Proportion = base_prop
+    ))
+  }
+}
+
+# Inicializar tabla para guardar resultados
+all_results <- data.frame()
+
+for (base in unique(seq_data$Base_5p)) {
+  base_data <- filter(seq_data, Base_5p == base)
+
+  # Kruskal-Wallis test
+  kw_test <- kruskal.test(Proportion ~ Clade, data = base_data)
+
+  if (kw_test$p.value < 0.05) {
+    # Post-hoc Dunn test
+    dunn <- dunnTest(Proportion ~ Clade, data = base_data, method = "bh")
+
+    # Extraer resultados
+    dunn_df <- dunn$res
+
+    # Separar comparación Clade1 vs Clade2
+    dunn_df <- dunn_df %>%
+      separate(Comparison, into = c("Clade_1", "Clade_2"), sep = " - ") %>%
+      mutate(Base_5p = base)
+
+    # Añadir medias por grupo
+    means <- base_data %>%
+      group_by(Clade) %>%
+      summarise(mean_prop = mean(Proportion), .groups = "drop")
+
+    dunn_df <- dunn_df %>%
+      left_join(means, by = c("Clade_1" = "Clade")) %>%
+      rename(Mean_1 = mean_prop) %>%
+      left_join(means, by = c("Clade_2" = "Clade")) %>%
+      rename(Mean_2 = mean_prop)
+
+    # Guardar
+    all_results <- bind_rows(all_results, dunn_df)
+  }
+}
+
+# Renombrar y ordenar columnas
+final_results <- all_results %>%
+  rename(
+    p_value = P.unadj,
+    adj_p = P.adj
+  ) %>%
+  select(Base_5p, Clade_1, Clade_2, Mean_1, Mean_2, p_value, adj_p) %>%
+  arrange(Base_5p, adj_p)
+
+# Guardar
+write.csv(final_results, "dunn_test_5p_base_CtoT.csv", row.names = FALSE)
+
+# Mostrar significativos
+cat("Comparaciones significativas (ajustadas):\n")
+print(final_results %>% filter(adj_p < 0.05))
+
+```
+
+## Representación (heat map) de la estadística mutaciones C>T
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(stringr)
+
+# Leer resultados del test de Dunn
+results <- read.csv("dunn_test_5p_base_CtoT.csv")
+
+# Calcular diferencia de medias
+results <- results %>%
+  mutate(
+    diff = Mean_1 - Mean_2,
+    label = ifelse(adj_p < 0.05, "*", "")
+  )
+
+# Crear columna de comparación para eje X
+results <- results %>%
+  mutate(Comparison = paste(Clade_1, "vs", Clade_2))
+
+# Crear heatmap (una faceta por base)
+p <- ggplot(results, aes(x = Comparison, y = Base_5p, fill = diff)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = label), color = "black", size = 6, fontface = "bold") +
+  scale_fill_gradient2(
+    low = "#4575B4", mid = "white", high = "#D73027",
+    midpoint = 0, name = "Diferencia de medias"
+  ) +
+  labs(
+    title = "Comparación entre clados por base 5’ en mutaciones C>T",
+    x = "Comparación entre clados", y = "Base 5’",
+    caption = "* indica significancia (adj p < 0.05)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold")
+  )
+
+# Guardar
+ggsave("heatmap_dunn_base5p.png", plot = p, width = 8, height = 5, dpi = 300)
+print(p)
+```
+
+## Estadística clado Ia vs clado Ib
+
+```{r}
+# Librerías
+library(dplyr)
+library(readr)
+library(stats)
+
+# Leer datos
+data_ia <- read.csv("Clade_Ia/snp_counts.csv", row.names = 1, check.names = FALSE)
+data_ib <- read.csv("Clade_Ib/snp_counts.csv", row.names = 1, check.names = FALSE)
+
+# Calcular proporciones por secuencia
+prop_ia <- data_ia / rowSums(data_ia)
+prop_ib <- data_ib / rowSums(data_ib)
+prop_ia[is.na(prop_ia)] <- 0
+prop_ib[is.na(prop_ib)] <- 0
+
+# Contextos compartidos (por si acaso)
+contextos <- intersect(colnames(prop_ia), colnames(prop_ib))
+
+# Inicializar tabla de resultados
+results <- data.frame()
+
+for (context in contextos) {
+  v1 <- prop_ia[[context]]
+  v2 <- prop_ib[[context]]
+  
+  test <- wilcox.test(v1, v2, exact = FALSE)
+  
+  results <- bind_rows(results, data.frame(
+    Context = context,
+    Mean_Ia = mean(v1),
+    Mean_Ib = mean(v2),
+    p_value = test$p.value
+  ))
+}
+
+# Ajuste por FDR
+results$adj_p <- p.adjust(results$p_value, method = "fdr")
+
+# Ordenar por significancia
+results <- results %>% arrange(adj_p)
+
+# Guardar resultados
+write.csv(results, "wilcoxon_96_contexts_Ia_vs_Ib.csv", row.names = FALSE)
+
+# Mostrar significativos
+cat("Contextos con diferencia significativa entre Clade Ia y Clade Ib (adj_p < 0.05):\n")
+print(results %>% filter(adj_p < 0.05))
+
+```
+
+## Representación (volcano plot) de la estadística clado Ia vs clado Ib
+
+```{r}
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(ggrepel)
+
+# Leer resultados
+results <- read_csv("wilcoxon_96_contexts_Ia_vs_Ib.csv")
+
+# Función para extraer tipo de mutación del contexto
+get_snp_type <- function(context_name) {
+  matches <- regmatches(context_name, regexpr("\\[[CT]>[AGTC]\\]", context_name))
+  if (length(matches) > 0) {
+    gsub("\\[|\\]", "", matches)
+  } else {
+    NA
+  }
+}
+
+# Agregar columnas necesarias
+results <- results %>%
+  mutate(
+    diff = Mean_Ib - Mean_Ia,
+    log_adj_p = -log10(adj_p),
+    Significant = adj_p < 0.05,
+    SNP_Type = sapply(Context, get_snp_type),
+    Color_Group = ifelse(Significant, SNP_Type, "ns")  # "ns" = no significativo
+  )
+
+# Colores: añade gris para no significativos
+custom_colors_full <- c(custom_colors, "ns" = "gray60")
+
+# Volcano plot con colores por tipo de SNP solo si son significativos
+p <- ggplot(results, aes(x = diff, y = log_adj_p)) +
+  geom_point(aes(color = Color_Group), alpha = 0.8, size = 2) +
+  scale_color_manual(values = custom_colors_full, name = "Tipo de SNP") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  ggrepel::geom_text_repel(
+    data = subset(results, Significant & abs(diff) > 0.005),
+    aes(label = Context),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.4,
+    segment.size = 0.2
+  ) +
+  labs(
+    title = "Volcano plot: comparación de contextos Ia vs Ib",
+    x = "Diferencia en proporción (Ib - Ia)",
+    y = "-log10(p ajustado)"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Guardar
+ggsave("volcano_plot_contexts_Ib_vs_Ia_colorSNP.png", plot = p, width = 14, height = 5, dpi = 300)
+
+```
+
+## Tabla proporción contextos (todos los clados)
+
+```{r}
+library(dplyr)
+
+# Inicializar lista para guardar los resultados
+clade_prop_list <- list()
+
+for (dataset in datasets) {
+  clade <- dataset$clade
+  csv_path <- dataset$file
+
+  if (!file.exists(csv_path)) {
+    warning("No se encontró:", csv_path)
+    next
+  }
+
+  # Leer archivo
+  snp_df <- read.csv(csv_path, row.names = 1, check.names = FALSE)
+
+  # Calcular proporciones por secuencia
+  prop_df <- snp_df / rowSums(snp_df)
+  prop_df[is.na(prop_df)] <- 0
+
+  # Promedio por contexto
+  mean_props <- colMeans(prop_df)
+
+  # Guardar en lista
+  clade_prop_list[[clade]] <- mean_props
+}
+
+# Combinar en un solo data frame (clados como filas)
+prop_matrix <- do.call(rbind, clade_prop_list)
+
+# Transponer: contextos como filas, clados como columnas
+prop_matrix_t <- as.data.frame(t(prop_matrix))
+
+# Guardar como CSV
+write.csv(prop_matrix_t, "tabla_contextos.csv", row.names = TRUE)
+print(prop_matrix_t)
+```
+
+## Tabla proporción mutaciones (todos los clados)
+
+```{r}
+library(dplyr)
+library(stringr)
+
+# Función para extraer tipo de mutación desde nombre del contexto
+get_snp_type <- function(context_name) {
+  str_match(context_name, "\\[([CT]>[AGTC])\\]")[,2]
+}
+
+# Inicializar lista
+mutation_summary_list <- list()
+
+for (dataset in datasets) {
+  clade <- dataset$clade
+  csv_path <- dataset$file
+  
+  if (!file.exists(csv_path)) {
+    warning("No se encontró:", csv_path)
+    next
+  }
+
+  # Leer archivo
+  snp_df <- read.csv(csv_path, row.names = 1, check.names = FALSE)
+  
+  # Calcular proporciones por secuencia
+  prop_df <- snp_df / rowSums(snp_df)
+  prop_df[is.na(prop_df)] <- 0
+
+  # Obtener tipo de mutación por columna
+  context_names <- colnames(prop_df)
+  mutation_types <- sapply(context_names, get_snp_type)
+
+  # Agrupar columnas por tipo de mutación y sumar sus proporciones
+  group_sums <- sapply(unique(mutation_types), function(mtype) {
+    if (is.na(mtype)) return(NA)
+    relevant_cols <- context_names[mutation_types == mtype]
+    colMeans(prop_df[, relevant_cols, drop = FALSE]) %>% sum()
+  })
+
+  # Guardar para este clado
+  mutation_summary_list[[clade]] <- group_sums
+}
+
+# Unir en una tabla: tipos de mutación como filas, clados como columnas
+mutation_summary_df <- do.call(cbind, mutation_summary_list)
+
+# Ordenar tipos de mutación
+mutation_summary_df <- mutation_summary_df[c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G"), ]
+
+# Guardar archivo CSV
+write.csv(mutation_summary_df, "tabla_mutaciones_por_clado.csv", row.names = TRUE)
+print(mutation_summary_df)
+```
+
+## Análisis mutacional clado Ib
+# Mutaciones por gen
+
+```{r}
+library(genbankr)
+library(tidyverse)
+
+# Carpeta a analizar
+folder <- "Clade_Ib"
+snp_file <- file.path(folder, "snp_positions_context.csv")
+gb_file <- file.path(folder, "NC_003310.gb")
+
+# Leer SNPs
+snps <- read.csv(snp_file)
+
+# Leer GenBank
+gb <- readGenBank(gb_file)
+features <- as.data.frame(gb@cds)[, c("gene", "start", "end")]
+features <- features[!is.na(features$gene), ]
+
+# Número total de secuencias únicas
+num_sequences <- length(unique(snps$seq))
+
+# Tabla con porcentajes de cada mutación única
+mutation_percentages <- snps %>%
+  group_by(pos, ref, alt, left, right, type) %>%
+  summarise(
+    count = n_distinct(seq),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    percentage = (count / num_sequences) * 100,
+    context = paste0(left, "[", ref, ">", alt, "]", right)
+  )
+
+# Mapear mutaciones a genes o intergénicas
+mutation_percentages <- mutation_percentages %>%
+  rowwise() %>%
+  mutate(
+    gene = {
+      match <- features[features$start <= pos & features$end >= pos, ]
+      if (nrow(match) > 0) match$gene[1] else "Intergénica"
+    }
+  ) %>%
+  ungroup()
+
+# Guardar tabla con porcentajes
+write.csv(mutation_percentages, file.path(folder, "mutation_percentages.csv"), row.names = FALSE)
+
+# Mutaciones únicas
+total_unique <- mutation_percentages %>%
+  distinct(pos, ref, alt, left, right, type, gene)
+
+# Contar mutaciones únicas por gen (incluyendo intergénicas)
+all_gene_summary <- total_unique %>%
+  group_by(gene) %>%
+  summarise(total_unique_mutations = n())
+
+# Mutaciones APOBEC3 únicas
+apo_unique <- total_unique %>%
+  filter(type == "C>T", left == "T")
+
+# Contar APOBEC3 únicas por gen (incluyendo intergénicas)
+apo_gene_summary <- apo_unique %>%
+  group_by(gene) %>%
+  summarise(apobec_unique_mutations = n())
+
+# Fusionar tablas
+combined_summary <- full_join(all_gene_summary, apo_gene_summary, by = "gene") %>%
+  replace_na(list(
+    total_unique_mutations = 0,
+    apobec_unique_mutations = 0
+  )) %>%
+  mutate(proportion_apobec = apobec_unique_mutations / total_unique_mutations)
+
+# Guardar CSVs
+write.csv(all_gene_summary, file.path(folder, "all_unique_mutations_by_gene.csv"), row.names = FALSE)
+write.csv(apo_gene_summary, file.path(folder, "apobec_unique_mutations_by_gene.csv"), row.names = FALSE)
+write.csv(combined_summary, file.path(folder, "combined_mutation_summary.csv"), row.names = FALSE)
+
+# Gráfico comparativo incluyendo "intergenic"
+
+# Preparar datos para gráfico apilado
+plot_data <- combined_summary %>%
+  filter(total_unique_mutations >= 3) %>%
+  pivot_longer(
+    cols = c(total_unique_mutations, apobec_unique_mutations),
+    names_to = "mutation_type",
+    values_to = "count"
+  ) %>%
+  mutate(
+    mutation_type = recode(mutation_type,
+                           total_unique_mutations = "Total",
+                           apobec_unique_mutations = "APOBEC3")
+  ) %>%
+  mutate(mutation_type = factor(mutation_type, levels = c("Total", "APOBEC3")))
+
+# Calcular mutaciones no-APOBEC para gráficas apiladas correctamente
+plot_data <- plot_data %>%
+  pivot_wider(names_from = mutation_type, values_from = count) %>%
+  mutate(Non_APOBEC3 = Total - APOBEC3) %>%
+  select(gene, APOBEC3, Non_APOBEC3) %>%
+  pivot_longer(cols = c(Non_APOBEC3, APOBEC3), names_to = "Type", values_to = "Count")
+
+# Gráfico de barras apiladas vertical, incluyendo "intergenic"
+ggplot(plot_data, aes(x = reorder(gene, -Count), y = Count, fill = Type)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Mutaciones por gen (≥3), incluyendo intergénicas y diferenciando APOBEC3",
+    x = "Gen",
+    y = "Número de mutaciones",
+    fill = "Tipo de mutación"
+  ) +
+  scale_fill_manual(values = c("Non_APOBEC3" = "gray70", "APOBEC3" = "#CC4551")) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Mutaciones por secuencia
+
+```{r}
+library(tidyverse)
+library(ggrepel)
+
+# Marcar si es APOBEC3 o no
+mutation_percentages <- mutation_percentages %>%
+  mutate(
+    is_apobec = ifelse(type == "C>T" & left == "T", "APOBEC3", "No APOBEC3")
+  )
+
+#  Filtrar mutaciones APOBEC3 frecuentes con gen conocido
+high_freq_apobec <- mutation_percentages %>%
+  filter(is_apobec == "APOBEC3", percentage > 75, !is.na(gene))
+
+# Crear el gráfico con etiquetas por encima y eje Y en saltos de 25
+apobec_plot <- ggplot(mutation_percentages, aes(x = pos, y = percentage, color = is_apobec)) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_color_manual(values = c("APOBEC3" = "#CC4551", "No APOBEC3" = "gray60")) +
+  geom_text_repel(
+    data = high_freq_apobec,
+    aes(label = gene),
+    nudge_y = 5,
+    direction = "y",
+    size = 4,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    segment.color = "#CC4551",
+    max.overlaps = Inf,
+    force = 2,
+    seed = 123
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 100, 25),
+    limits = c(0, max(100, max(mutation_percentages$percentage) + 10))
+  ) +
+  labs(
+    title = "Mutaciones APOBEC3 frecuentes anotadas por gen",
+    x = "Posición genómica",
+    y = "Porcentaje de secuencias con la mutación",
+    color = "Tipo de mutación"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Mostrar el gráfico
+print(apobec_plot)
+
+# Exportar el gráfico
+output_folder <- folder 
+
+# Guardar como PNG
+ggsave(
+  filename = file.path(output_folder, "apobec3_highfreq_labeled.png"),
+  plot = apobec_plot,
+  width = 10, height = 6, dpi = 300
+)
+
+# Guardar como PDF
+ggsave(
+  filename = file.path(output_folder, "apobec3_highfreq_labeled.pdf"),
+  plot = apobec_plot,
+  width = 10, height = 6
+)
+```
+# Determinar frecuencias
+
+```{r}
+# Clasificar mutaciones en intervalos de frecuencia
+mutation_bins <- mutation_percentages %>%
+  mutate(
+    interval = case_when(
+      percentage <= 25 ~ "0–25%",
+      percentage >= 75 ~ "75–100%",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(interval))  # mantener solo mutaciones de interés
+
+# Calcular proporciones por intervalo
+interval_summary <- mutation_bins %>%
+  group_by(interval, is_apobec) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(interval) %>%
+  mutate(
+    total = sum(n),
+    percentage = (n / total) * 100
+  ) %>%
+  ungroup()
+
+# Calcular resumen total (todas mutaciones sin agrupar por intervalo)
+total_summary <- mutation_bins %>%
+  group_by(is_apobec) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(
+    interval = "Total",
+    total = sum(n),
+    percentage = (n / total) * 100
+  ) %>%
+  select(interval, is_apobec, n, total, percentage)
+
+# Combinar todo
+combined_summary <- bind_rows(interval_summary, total_summary)
+
+combined_summary
+```
+
+# Determinar impacto mutaciones 
+
+```{r}
+library(tidyverse)
+library(ggrepel)
+library(Biostrings)
+library(GenomicRanges)
+library(genbankr)
+
+# Cargar datos
+folder <- "Clade_Ib"
+snp_file <- file.path(folder, "snp_positions_context.csv")
+gb_file <- file.path(folder, "NC_003310.gb")
+ref_path <- file.path(folder, "NC_003310_ref.fasta")
+
+# Leer SNPs
+snps <- read.csv(snp_file)
+
+# Leer GenBank y CDS
+gb <- readGenBank(gb_file)
+cds_ranges <- cds(gb)
+cds_df <- as.data.frame(cds_ranges) %>%
+  mutate(cds_id = row_number())
+
+# Leer referencia genómica
+ref <- readDNAStringSet(ref_path)
+ref_seq_dna <- DNAString(as.character(ref[[1]]))
+
+# Calcular porcentaje de mutaciones
+num_sequences <- length(unique(snps$seq))
+
+mutation_percentages <- snps %>%
+  group_by(pos, ref, alt, left, right, type) %>%
+  summarise(
+    count = n_distinct(seq),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    percentage = (count / num_sequences) * 100,
+    context = paste0(left, "[", ref, ">", alt, "]", right),
+    is_apobec = ifelse(type == "C>T" & left == "T", "APOBEC3", "No APOBEC3")
+  )
+
+# Filtrar mutaciones APOBEC3 frecuentes
+high_freq_apobec <- mutation_percentages %>%
+  filter(is_apobec == "APOBEC3", percentage > 75)
+
+# Preparar GenomicRanges y corregir seqnames
+high_freq_apobec_clean <- high_freq_apobec %>%
+  mutate(seqnames = "DUMMY", start = pos, end = pos)
+
+high_freq_apobec_gr <- GRanges(
+  seqnames = high_freq_apobec_clean$seqnames,
+  ranges = IRanges(start = high_freq_apobec_clean$start, end = high_freq_apobec_clean$end)
+)
+
+# Corregir seqnames para que coincidan con los del GenBank
+seqlevels(high_freq_apobec_gr) <- seqlevels(cds_ranges)
+seqnames(high_freq_apobec_gr) <- Rle(factor(rep(seqlevels(cds_ranges), length(high_freq_apobec_gr))))
+
+# Asociar mutaciones a CDS
+overlap_hits <- findOverlaps(high_freq_apobec_gr, cds_ranges)
+
+annotated_mutations <- high_freq_apobec_clean %>%
+  mutate(pos = as.integer(pos)) %>%
+  left_join(
+    tibble(
+      pos = start(high_freq_apobec_gr)[queryHits(overlap_hits)],
+      cds_index = subjectHits(overlap_hits)
+    ),
+    by = "pos"
+  ) %>%
+  left_join(
+    cds_df %>%
+      select(cds_index = cds_id, cds_start = start, cds_end = end, cds_strand = strand, gene),
+    by = "cds_index"
+  ) %>%
+  filter(!is.na(cds_index)) %>%
+  mutate(cds_strand = as.character(cds_strand))
+
+# Función para evaluar el efecto de la mutación
+evaluate_effect <- function(pos, alt, cds_start, cds_end, cds_strand, ref_seq) {
+  if (is.na(cds_start) || is.na(cds_end) || is.na(cds_strand)) return(NA)
+
+  strand_char <- as.character(cds_strand)
+  rel_pos <- if (strand_char == "+") {
+    pos - cds_start + 1
+  } else {
+    cds_end - pos + 1
+  }
+
+  codon_index <- ceiling(rel_pos / 3)
+  codon_start <- (codon_index - 1) * 3 + 1
+  codon_end <- codon_start + 2
+
+  cds_seq <- subseq(ref_seq, start = cds_start, end = cds_end)
+  if (strand_char == "-") cds_seq <- reverseComplement(cds_seq)
+
+  if (codon_end > length(cds_seq)) return(NA)
+
+  orig_codon <- as.character(subseq(cds_seq, codon_start, codon_end))
+  codon_chars <- strsplit(orig_codon, "")[[1]]
+
+  codon_pos <- rel_pos %% 3
+  if (codon_pos == 0) codon_pos <- 3
+  codon_chars[codon_pos] <- alt
+  mut_codon <- paste0(codon_chars, collapse = "")
+
+  aa_orig <- as.character(translate(DNAString(orig_codon)))
+  aa_mut <- as.character(translate(DNAString(mut_codon)))
+
+  if (aa_orig == aa_mut) {
+    return("Sinónima")
+  } else {
+    return(paste0(aa_orig, codon_index, aa_mut))  # Formato: Y123N
+  }
+}
+
+# Evaluar efecto de cada mutación
+annotated_mutations <- annotated_mutations %>%
+  rowwise() %>%
+  mutate(
+    effect = evaluate_effect(pos, alt, cds_start, cds_end, cds_strand, ref_seq_dna)
+  ) %>%
+  ungroup()
+
+# Exportar resultados
+write.csv(
+  annotated_mutations %>%
+    select(pos, gene, ref, alt, percentage, effect),
+  file.path(folder, "apobec3_effects_summary.csv"),
+  row.names = FALSE
+)
+
+annotated_mutations %>%
+  select(pos, gene, ref, alt, percentage, effect)
+
+```
+
+# Mutaciones por longitud del gen
+
+```{r}
+library(genbankr)
+library(tidyverse)
+library(Biostrings)
+library(GenomicRanges)
+
+# Rutas y carga de archivos
+folder <- "Clade_Ib"
+snp_file <- file.path(folder, "snp_positions_context.csv")
+gb_file <- file.path(folder, "NC_003310.gb")
+ref_file <- file.path(folder, "NC_003310_ref.fasta")
+
+# Leer SNPs
+snps <- read.csv(snp_file)
+
+# Leer GenBank y CDS
+gb <- readGenBank(gb_file)
+cds_ranges <- cds(gb)
+cds_df <- as.data.frame(cds_ranges) %>%
+  mutate(cds_id = row_number(), length = width)
+
+# Leer secuencia de referencia
+ref <- readDNAStringSet(ref_file)
+ref_seq <- DNAString(as.character(ref[[1]]))
+
+# Calcular porcentaje por mutación única
+num_sequences <- length(unique(snps$seq))
+
+mutation_percentages <- snps %>%
+  group_by(pos, ref, alt, left, right, type) %>%
+  summarise(count = n_distinct(seq), .groups = "drop") %>%
+  mutate(percentage = (count / num_sequences) * 100,
+         context = paste0(left, "[", ref, ">", alt, "]", right))
+
+# Mapear mutaciones a CDS
+mutation_gr <- GRanges(
+  seqnames = seqlevels(cds_ranges)[1],
+  ranges = IRanges(start = mutation_percentages$pos, width = 1)
+)
+
+seqlevels(mutation_gr) <- seqlevels(cds_ranges)
+seqnames(mutation_gr) <- Rle(factor(rep(seqlevels(cds_ranges), length(mutation_gr))))
+
+hits <- findOverlaps(mutation_gr, cds_ranges)
+
+mutation_percentages$cds_index <- NA_integer_
+mutation_percentages$cds_index[queryHits(hits)] <- subjectHits(hits)
+
+mutation_annotated <- mutation_percentages %>%
+  left_join(
+    cds_df %>%
+      select(cds_index = cds_id, cds_start = start, cds_end = end, cds_strand = strand, gene),
+    by = "cds_index"
+  )
+
+# Evaluar efecto (sinónima / no sinónima)
+evaluate_effect <- function(pos, alt, cds_start, cds_end, cds_strand, ref_seq) {
+  if (is.na(cds_start) | is.na(cds_end) | is.na(cds_strand)) return(NA)
+
+  strand_char <- as.character(cds_strand)
+  rel_pos <- if (strand_char == "+") {
+    pos - cds_start + 1
+  } else {
+    cds_end - pos + 1
+  }
+
+  codon_index <- ceiling(rel_pos / 3)
+  codon_start <- (codon_index - 1) * 3 + 1
+  codon_end <- codon_start + 2
+
+  cds_seq <- subseq(ref_seq, start = cds_start, end = cds_end)
+  if (strand_char == "-") cds_seq <- reverseComplement(cds_seq)
+
+  if (codon_end > length(cds_seq)) return(NA)
+
+  orig_codon <- as.character(subseq(cds_seq, codon_start, codon_end))
+  codon_chars <- strsplit(orig_codon, "")[[1]]
+
+  codon_pos <- rel_pos %% 3
+  if (codon_pos == 0) codon_pos <- 3
+  codon_chars[codon_pos] <- alt
+  mut_codon <- paste0(codon_chars, collapse = "")
+
+  aa_orig <- as.character(translate(DNAString(orig_codon)))
+  aa_mut <- as.character(translate(DNAString(mut_codon)))
+
+  if (aa_orig == aa_mut) {
+    return("Sinónima")
+  } else {
+    return("No sinónima")
+  }
+}
+
+mutation_annotated <- mutation_annotated %>%
+  rowwise() %>%
+  mutate(effect = evaluate_effect(pos, alt, cds_start, cds_end, cds_strand, ref_seq)) %>%
+  ungroup()
+
+# Filtrar solo mutaciones no sinónimas
+mutation_non_syn <- mutation_annotated %>%
+  filter(effect == "No sinónima")
+
+# Resumen por gen con densidad
+total_unique <- mutation_non_syn %>%
+  distinct(pos, ref, alt, left, right, type, gene)
+
+all_gene_summary <- total_unique %>%
+  group_by(gene) %>%
+  summarise(total_unique_mutations = n())
+
+apo_gene_summary <- total_unique %>%
+  filter(type == "C>T", left == "T") %>%
+  group_by(gene) %>%
+  summarise(apobec_unique_mutations = n())
+
+combined_summary <- full_join(all_gene_summary, apo_gene_summary, by = "gene") %>%
+  replace_na(list(
+    total_unique_mutations = 0,
+    apobec_unique_mutations = 0
+  )) %>%
+  left_join(cds_df %>% select(gene, length), by = "gene") %>%
+  mutate(
+    mutation_density_total = total_unique_mutations / length,
+    mutation_density_apobec = apobec_unique_mutations / length
+  )
+
+# Guardar tablas
+write.csv(combined_summary, file.path(folder, "non_syn_combined_density_summary.csv"), row.names = FALSE)
+
+# Preparar datos para gráfico de densidad
+plot_data <- combined_summary %>%
+filter(!is.na(length)) %>%
+  arrange(desc(mutation_density_total)) %>%
+  slice_head(n = 50) %>%
+  mutate(Non_APOBEC3 = mutation_density_total - mutation_density_apobec) %>%
+  select(gene, mutation_density_apobec, Non_APOBEC3) %>%
+  pivot_longer(
+    cols = c(Non_APOBEC3, mutation_density_apobec),
+    names_to = "Type",
+    values_to = "Density"
+  )
+
+plot_data$Type <- recode(plot_data$Type,
+                         mutation_density_apobec = "APOBEC3",
+                         Non_APOBEC3 = "Non_APOBEC3")
+
+# Generar gráfico
+ggplot(plot_data, aes(x = factor(gene, levels = sort(unique(gene))), y = Density, fill = Type)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Densidad de mutaciones NO SINÓNIMAS por gen",
+    x = "Gen",
+    y = "Mutaciones no sinónimas por base del gen",
+    fill = "Tipo de mutación"
+  ) +
+  scale_fill_manual(values = c("Non_APOBEC3" = "gray70", "APOBEC3" = "#CC4551")) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+# Guardar gráfico como PNG
+ggsave(
+  filename = file.path(folder, "non_syn_mutation_density_by_gene.png"),
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+```
+
+#Recuento
+
+```{r}
+# 1. Mutaciones únicas en regiones codificantes (con CDS asignado)
+mutations_coding <- mutation_annotated %>%
+  filter(!is.na(gene)) %>%
+  distinct(pos, ref, alt, left, right, type, gene)
+
+total_coding_mut <- nrow(mutations_coding)
+total_coding_apobec <- mutations_coding %>%
+  filter(type == "C>T", left == "T") %>%
+  nrow()
+total_coding_non_apobec <- total_coding_mut - total_coding_apobec
+
+# 2. Mutaciones no sinónimas en regiones codificantes
+mutations_coding_non_syn <- mutation_annotated %>%
+  filter(!is.na(gene), effect == "No sinónima") %>%
+  distinct(pos, ref, alt, left, right, type, gene)
+
+total_non_syn <- nrow(mutations_coding_non_syn)
+total_non_syn_apobec <- mutations_coding_non_syn %>%
+  filter(type == "C>T", left == "T") %>%
+  nrow()
+total_non_syn_non_apobec <- total_non_syn - total_non_syn_apobec
+
+cat("Resumen de mutaciones en regiones codificantes:\n")
+cat("Total mutaciones únicas en CDS: ", total_coding_mut, "\n")
+cat("   - APOBEC3: ", total_coding_apobec, "\n")
+cat("   - No APOBEC3: ", total_coding_non_apobec, "\n\n")
+
+cat("Mutaciones NO SINÓNIMAS en CDS: ", total_non_syn, "\n")
+cat("   - APOBEC3: ", total_non_syn_apobec, "\n")
+cat("   - No APOBEC3: ", total_non_syn_non_apobec, "\n")
+
+```
+
+# Mutaciones OPG164
+
+```{r}
+library(tidyverse)
+library(Biostrings)
+library(GenomicRanges)
+library(genbankr)
+
+# Cargar datos
+folder <- "Clade_Ib"
+snp_file <- file.path(folder, "snp_positions_context.csv")
+gb_file <- file.path(folder, "NC_003310.gb")
+ref_file <- file.path(folder, "NC_003310_ref.fasta")
+
+# Leer SNPs
+snps <- read.csv(snp_file)
+
+# Leer GenBank y CDS
+gb <- readGenBank(gb_file)
+cds_ranges <- cds(gb)
+cds_df <- as.data.frame(cds_ranges) %>%
+  mutate(cds_id = row_number())
+
+# Leer secuencia de referencia
+ref <- readDNAStringSet(ref_file)
+ref_seq_dna <- DNAString(as.character(ref[[1]]))
+
+# Calcular porcentaje por mutación única
+num_sequences <- length(unique(snps$seq))
+
+mutation_percentages <- snps %>%
+  group_by(pos, ref, alt, left, right, type) %>%
+  summarise(count = n_distinct(seq), .groups = "drop") %>%
+  mutate(
+    percentage = (count / num_sequences) * 100,
+    context = paste0(left, "[", ref, ">", alt, "]", right),
+    is_apobec = ifelse(type == "C>T" & left == "T", "APOBEC3", "No APOBEC3")
+  )
+
+# Mapear mutaciones a CDS
+mutation_gr <- GRanges(
+  seqnames = seqlevels(cds_ranges)[1],
+  ranges = IRanges(start = mutation_percentages$pos, width = 1)
+)
+
+seqlevels(mutation_gr) <- seqlevels(cds_ranges)
+seqnames(mutation_gr) <- Rle(factor(rep(seqlevels(cds_ranges), length(mutation_gr))))
+
+hits <- findOverlaps(mutation_gr, cds_ranges)
+
+mutation_percentages$cds_index <- NA_integer_
+mutation_percentages$cds_index[queryHits(hits)] <- subjectHits(hits)
+
+mutation_annotated <- mutation_percentages %>%
+  left_join(
+    cds_df %>%
+      select(cds_index = cds_id, cds_start = start, cds_end = end, cds_strand = strand, gene),
+    by = "cds_index"
+  ) %>%
+  filter(gene == "OPG164") %>%
+  mutate(cds_strand = as.character(cds_strand))
+
+# Evaluar efecto sinónimo / no sinónimo
+evaluate_effect <- function(pos, alt, cds_start, cds_end, cds_strand, ref_seq) {
+  if (is.na(cds_start) || is.na(cds_end) || is.na(cds_strand)) return(NA)
+
+  strand_char <- as.character(cds_strand)
+  rel_pos <- if (strand_char == "+") {
+    pos - cds_start + 1
+  } else {
+    cds_end - pos + 1
+  }
+
+  codon_index <- ceiling(rel_pos / 3)
+  codon_start <- (codon_index - 1) * 3 + 1
+  codon_end <- codon_start + 2
+
+  cds_seq <- subseq(ref_seq, start = cds_start, end = cds_end)
+  if (strand_char == "-") cds_seq <- reverseComplement(cds_seq)
+
+  if (codon_end > length(cds_seq)) return(NA)
+
+  orig_codon <- as.character(subseq(cds_seq, codon_start, codon_end))
+  codon_chars <- strsplit(orig_codon, "")[[1]]
+
+  codon_pos <- rel_pos %% 3
+  if (codon_pos == 0) codon_pos <- 3
+  codon_chars[codon_pos] <- alt
+  mut_codon <- paste0(codon_chars, collapse = "")
+
+  aa_orig <- as.character(translate(DNAString(orig_codon)))
+  aa_mut <- as.character(translate(DNAString(mut_codon)))
+
+  if (aa_orig == aa_mut) {
+    return("Sinónima")
+  } else {
+    return(paste0(aa_orig, codon_index, aa_mut))  # Formato tipo Y123N
+  }
+}
+
+# Añadir posición relativa al gen
+mutation_opg164 <- mutation_annotated %>%
+  filter(gene == "OPG164") %>%
+  mutate(
+    cds_strand = as.character(cds_strand),
+    gene_pos = if_else(
+      cds_strand == "+",
+      pos - cds_start + 1,
+      cds_end - pos + 1
+    )
+  ) %>%
+  rowwise() %>%
+  mutate(
+    effect = evaluate_effect(pos, alt, cds_start, cds_end, cds_strand, ref_seq_dna)
+  ) %>%
+  ungroup() %>%
+  select(gene_pos, ref, alt, percentage, is_apobec, effect) %>%
+  arrange(gene_pos)
+
+# Exportar tabla final
+write.csv(
+  mutation_opg164,
+  file.path(folder, "OPG164_mutation_summary.csv"),
+  row.names = FALSE
+)
+
+print(mutation_opg164)
+```
